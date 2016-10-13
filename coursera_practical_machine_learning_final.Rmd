@@ -1,0 +1,180 @@
+---
+title: "coursera_practical_machine_learning_final"
+author: "Bruce Walthers"
+date: "10/12/2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("~/data_science/Coursera_practical_machine_learning")
+# Load necessary packages
+library(caret)
+library(data.table)
+library(Matrix)
+
+# allow parallel processing
+#library(doMC)
+#parallel:::detectCores()
+#registerDoMC(cores = 4)
+
+# Download training file
+url1<-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+trainfile='pml-training.csv'
+if (! file.exists(trainfile)) {
+        download.file(url1, destfile = trainfile)
+        
+}
+train_raw<-fread('pml-training.csv')
+
+# Download testing file
+url2<-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+testfile='pml-testing.csv'
+if (! file.exists(testfile)) {
+        download.file(url2, destfile = testfile)
+        
+}
+validation<-fread('pml-testing.csv')
+rm(testfile)
+rm(trainfile)
+rm(url1)
+rm(url2)
+
+# Remove "#DIV/0!" from dataset
+train_raw[train_raw=="#DIV/0!"]<-0
+validation[validation=="#DIV/0!"]<-0
+
+# change character columns to numeric
+cols_numeric<-c("V1", "kurtosis_roll_belt", "kurtosis_picth_belt", "kurtosis_yaw_belt",
+                "skewness_roll_belt", "skewness_roll_belt.1", "skewness_yaw_belt", "max_yaw_belt",
+                "min_yaw_belt", "amplitude_yaw_belt", "kurtosis_roll_arm", "kurtosis_picth_arm",
+                "kurtosis_yaw_arm", "skewness_roll_arm", "skewness_pitch_arm", "skewness_yaw_arm",
+                "kurtosis_roll_dumbbell", "kurtosis_picth_dumbbell", "kurtosis_yaw_dumbbell",
+                "skewness_roll_dumbbell", "skewness_pitch_dumbbell", "skewness_yaw_dumbbell",
+                "max_yaw_dumbbell", "min_yaw_dumbbell", "amplitude_yaw_dumbbell",
+                "kurtosis_roll_forearm", "kurtosis_picth_forearm", "kurtosis_yaw_forearm",
+                "skewness_roll_forearm", "skewness_pitch_forearm", "skewness_yaw_forearm",
+                "max_yaw_forearm", "min_yaw_forearm", "amplitude_yaw_forearm")
+train_raw[, (cols_numeric) := lapply(.SD, as.numeric), .SDcols= cols_numeric]
+validation[, (cols_numeric) := lapply(.SD, as.numeric), .SDcols= cols_numeric]
+# columns to change to factor
+cols_factor<-c("user_name","new_window", "classe" )
+train_raw[, c("user_name","new_window", "classe" ) := lapply(.SD, as.factor), .SDcols= c("user_name","new_window", "classe" )]
+validation[, c("user_name","new_window"):= lapply(.SD, as.factor), .SDcols= c("user_name","new_window")]
+#columns to delete
+cols_delete<-c("cvtd_timestamp")
+train_raw[, cvtd_timestamp :=NULL]
+validation[, cvtd_timestamp :=NULL]
+# turn username into dummy variable training 
+dmy<- dummyVars(" ~ user_name", data=train_raw, fullRank=T)
+new_user_name <- data.frame(predict(dmy, newdata = train_raw))
+train_raw<-cbind(train_raw, new_user_name)
+rm(new_user_name)
+# turn username into dummy variable validation
+dmy<- dummyVars(" ~ user_name", data=validation, fullRank=T)
+new_user_name <- data.frame(predict(dmy, newdata = validation))
+validation<-cbind(validation, new_user_name)
+rm(new_user_name)
+# turn username into dummy variable training 
+dmy<- dummyVars(" ~ new_window", data=train_raw, fullRank=T)
+new_new_window <- data.frame(predict(dmy, newdata = train_raw))
+train_raw<-cbind(train_raw, new_new_window)
+rm(new_new_window)
+# turn username into dummy variable validation
+validation[, new_window.yes := 0]
+
+# Identify Near Zero Variance predictors NZV - Remove zero covariates
+nzv<-nearZeroVar(train_raw)
+train_raw<-train_raw[, .SD, .SDcols=-nzv]
+validation<-validation[, .SD, .SDcols=-nzv]
+```
+
+## Data Preparation
+
+When I loaded the dataset into R, I needed to change a few column classes to "numeric"" because they came in as "character."  The primary reason for this was several of the columns had a divide by zero error, "#DIV/0!", which forced the column to auto-convert to character instead of numeric.  I simply replaced those divide by zero values with an actual zero and then converted the column to numeric.  I also looked for near zero variance variables and removed those from the model.  
+
+## Partitioning Datasets
+I split the train dataset into 2 datasets, training and testing, using the createDataPartition function in caret. I also made the decision at this point to remove any variables where the NA percentage for that variable was above 95%.  My thought process was there would not be much signal there and if I turned out to be wrong, I could add those back.  I never added them back.
+
+```{r partitioning_datasets, echo=FALSE}
+# Split training data into train and test
+inTrain<-createDataPartition(y=train_raw$classe, p=0.7, list=F)
+training<-train_raw[inTrain,]
+testing<-train_raw[-inTrain,]
+
+# Remove columns where over 95% of the values are NA
+columns<-data.frame(apply(training, 2, function(x) mean(is.na(x))))
+names(columns)[1]<-c("percentage_NA")
+columns$col_name<-row.names(columns)
+row.names(columns) <- NULL 
+columns<-columns[columns$percentage_NA>0.95,]
+# Ignore these features in the model
+
+```
+
+```{r}
+dim(training)
+dim(testing)
+dim(validation)
+```
+
+## Building of my model
+
+I decided to build a GBM model.  I used 10-fold cross validation with 3 repeats in the model. I trained the model using the caret package.  I printed out the variable importance for the model and I have reproduced the plot below.  I could have choosen to remove some of the lower importance variables for a more parsimonious model but decided to keep them in.
+
+```{r building_model, echo=FALSE, include=FALSE}
+# Ok, now lets train the model
+# Select model features
+mdl_def_tree<-paste("roll_belt+pitch_belt+yaw_belt+total_accel_belt+gyros_belt_x",
+                    "+gyros_belt_y+gyros_belt_z+accel_belt_x+accel_belt_y",
+                    "+accel_belt_z+magnet_belt_x+magnet_belt_y+magnet_belt_z",
+                    "+roll_arm+pitch_arm+yaw_arm+total_accel_arm+gyros_arm_x",
+                    "+gyros_arm_y+gyros_arm_z+accel_arm_x+accel_arm_y+accel_arm_z",
+                    "+magnet_arm_x+magnet_arm_y+magnet_arm_z+roll_dumbbell",
+                    "+pitch_dumbbell+yaw_dumbbell+total_accel_dumbbell",
+                    "+gyros_dumbbell_x+gyros_dumbbell_y+gyros_dumbbell_z",
+                    "+accel_dumbbell_x+accel_dumbbell_y+accel_dumbbell_z",
+                    "+magnet_dumbbell_x+magnet_dumbbell_y+magnet_dumbbell_z",
+                    "+roll_forearm+pitch_forearm+yaw_forearm+total_accel_forearm",
+                    "+gyros_forearm_x+gyros_forearm_y+gyros_forearm_z",
+                    "+accel_forearm_x+accel_forearm_y+accel_forearm_z",
+                    "+magnet_forearm_x+magnet_forearm_y+magnet_forearm_z",
+                    "+user_name.carlitos+user_name.charles+user_name.eurico",
+                    "+user_name.jeremy+user_name.pedro"
+)
+
+ptm <- proc.time() # time my code
+tr_control<-trainControl(verboseIter = T,
+                         method="repeatedcv",
+                         number=10,
+                         repeats = 3)
+modgbm<-train(as.formula(paste("classe~", mdl_def_tree)), method="gbm", data=training, trControl=tr_control, na.action = na.pass)
+finish<-proc.time() - ptm
+#finish
+rm(finish);rm(ptm)
+
+varImp(modgbm) # show variable importance for model
+gbmImp<-varImp(modgbm, scale = T) # save to device
+
+
+```
+
+```{r, echo=FALSE}
+#gbmImp # show importance
+plot(gbmImp, top=20)
+```
+
+## Predict testing set and check performance
+Once my model was trained, I predicted the testing set and check the performance using the confusionMatrix function in caret.  The performance was 96.3% and based on that I anticipate my out-of-sample error would be close to 96% like I found in the testing set.
+
+```{r, echo=FALSE}
+pred<-predict(modgbm, testing) # Predict on the testing set
+cm<-confusionMatrix(pred, testing$classe) #suggests out-of-sample error
+cm$table
+cm$overall[1]
+
+```
+
+## Predicting the validation set
+Next, I predicted the validation set and entered the answers into the class quiz.  I received a 20/20 so all my predictions were accurate which seems to be inline or slightly better then what I had expected the accuracy to be.
